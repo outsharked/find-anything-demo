@@ -1,0 +1,3 @@
+[deploy]
+healthcheckPath = "/api/v1/settings"
+healthcheckTimeout = 60

@@ -1,0 +1,1 @@
+# Binary content is stored directly (no LFS) so Docker builds work without git-lfs.
