@@ -10,10 +10,12 @@ Usage:
   --backfill   Also fetch articles from the last 30 days (run once on first start)
 
 Outputs:
-  <live-dir>/wikinews/<safe-title>.txt  — one file per Wikinews article
-  <live-dir>/arxiv/<arxiv-id>.txt       — one file per arXiv abstract
+  <live-dir>/wikinews/<date> - <title>/index.html   — article with images
+  <live-dir>/wikinews/<date> - <title>/media/       — downloaded images
+  <live-dir>/arxiv/<arxiv-id>.txt                   — one file per arXiv abstract
 """
 
+import html as html_mod
 import json
 import re
 import sys
@@ -33,6 +35,8 @@ NEWS_DIR.mkdir(parents=True, exist_ok=True)
 ARXIV_DIR.mkdir(parents=True, exist_ok=True)
 
 HEADERS = {"User-Agent": "find-anything-demo/1.0 (https://github.com/outsharked/find-anything)"}
+
+MAX_IMAGES_PER_ARTICLE = 6
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -60,27 +64,47 @@ def get_json(url: str) -> dict:
 
 
 def safe_filename(title: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', '_', title)[:200]
-
-
-def strip_wikitext(text: str) -> str:
-    """Remove common wiki markup to leave readable plain text."""
-    while "{{" in text:
-        text = re.sub(r'\{\{[^{}]*\}\}', '', text)
-    text = re.sub(r'\[\[(?:[^|\]]*\|)?([^\]]*)\]\]', r'\1', text)
-    text = re.sub(r"'{2,}", '', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+    return re.sub(r'[\\/:*?"<>|]', '_', title)[:180]
 
 
 # ── Wikinews ──────────────────────────────────────────────────────────────────
 
-WIKINEWS_API = "https://en.wikinews.org/w/api.php"
+WIKINEWS_API  = "https://en.wikinews.org/w/api.php"
+WIKINEWS_REST = "https://en.wikinews.org/api/rest_v1/page"
+
+HTML_WRAPPER = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+  body       {{ font-family: Georgia, serif; max-width: 820px; margin: 2rem auto;
+                padding: 0 1.5rem; line-height: 1.75; color: #1a1a1a; }}
+  h1         {{ font-family: sans-serif; font-size: 1.8rem; margin-bottom: .2rem; }}
+  .meta      {{ font-size: .85rem; color: #666; margin-bottom: 1.8rem; }}
+  img        {{ max-width: 100%; height: auto; display: block; }}
+  figure     {{ margin: 1.5rem 0; }}
+  figcaption {{ font-size: .8rem; color: #555; margin-top: .3rem; }}
+  table      {{ border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; }}
+  td, th     {{ border: 1px solid #ccc; padding: .4rem .6rem; }}
+  a          {{ color: #0645ad; }}
+  .thumb     {{ float: right; clear: right; margin: 0 0 1rem 1.5rem; max-width: 280px; }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<p class="meta">Published {date} &middot;
+  <a href="https://en.wikinews.org/wiki/{url_title}" target="_blank">View on Wikinews</a></p>
+{body}
+</body>
+</html>
+"""
 
 
-def wikinews_titles_by_date(start: str, end: str, limit: int = 500) -> list[str]:
-    """Return article titles for the date range (MediaWiki timestamp format)."""
+def wikinews_titles_by_date(start: str, end: str, limit: int = 500) -> list[tuple[str, str]]:
+    """Return (title, date) pairs for the date range (MediaWiki timestamp format)."""
     params = urllib.parse.urlencode({
         "action":      "query",
         "list":        "recentchanges",
@@ -88,101 +112,177 @@ def wikinews_titles_by_date(start: str, end: str, limit: int = 500) -> list[str]
         "rclimit":     limit,
         "rctype":      "new",
         "rcprop":      "title|timestamp",
-        "rcstart":     end,    # MediaWiki: rcstart > rcend (newest first)
+        "rcstart":     end,
         "rcend":       start,
         "format":      "json",
     })
     data = get_json(f"{WIKINEWS_API}?{params}")
-    return [rc["title"] for rc in data.get("query", {}).get("recentchanges", [])]
+    return [
+        (rc["title"], rc.get("timestamp", "")[:10])
+        for rc in data.get("query", {}).get("recentchanges", [])
+    ]
 
 
-def wikinews_recent_titles(limit: int = 60) -> list[str]:
-    """Return recently changed/created article titles."""
+def wikinews_recent_titles(limit: int = 60) -> list[tuple[str, str]]:
+    """Return recently changed/created (title, date) pairs."""
     params = urllib.parse.urlencode({
         "action":      "query",
         "list":        "recentchanges",
         "rcnamespace": "0",
         "rclimit":     limit,
         "rctype":      "new|edit",
-        "rcprop":      "title",
+        "rcprop":      "title|timestamp",
         "format":      "json",
     })
     data = get_json(f"{WIKINEWS_API}?{params}")
-    return [rc["title"] for rc in data.get("query", {}).get("recentchanges", [])]
+    return [
+        (rc["title"], rc.get("timestamp", "")[:10])
+        for rc in data.get("query", {}).get("recentchanges", [])
+    ]
 
 
-def wikinews_article_text(title: str, _depth: int = 0) -> str | None:
-    """Return plain-text article body, following one redirect."""
-    if _depth > 1:
+def wikinews_fetch_html(title: str) -> str | None:
+    """Fetch rendered HTML body for the article from the REST API."""
+    encoded = urllib.parse.quote(title.replace(' ', '_'), safe='')
+    raw = fetch(f"{WIKINEWS_REST}/html/{encoded}")
+    if not raw:
         return None
-    params = urllib.parse.urlencode({
-        "action": "parse",
-        "page":   title,
-        "prop":   "wikitext",
-        "format": "json",
-    })
-    data = get_json(f"{WIKINEWS_API}?{params}")
-    wikitext = data.get("parse", {}).get("wikitext", {}).get("*", "")
-    if not wikitext:
-        return None
-    redirect = re.match(r"#REDIRECT\s*\[\[(.+?)\]\]", wikitext, re.IGNORECASE)
-    if redirect:
-        return wikinews_article_text(redirect.group(1), _depth + 1)
-    return strip_wikitext(wikitext) or None
+    html = raw.decode('utf-8', errors='replace')
+    # Extract just the body content from the full document
+    m = re.search(r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else html
 
 
-def save_wikinews_titles(titles: list[str], max_articles: int) -> int:
+def _download_images(html_body: str, media_dir: Path) -> str:
+    """Download Wikimedia images into media/ and rewrite src attributes."""
+    img_re = re.compile(r'src="((?:https?:)?//upload\.wikimedia\.org/[^"]+)"')
+    downloaded = 0
+
+    def replace(m: re.Match) -> str:
+        nonlocal downloaded
+        if downloaded >= MAX_IMAGES_PER_ARTICLE:
+            return m.group(0)
+        url = html_mod.unescape(m.group(1))  # decode &amp; → &
+        if url.startswith('//'):
+            url = 'https:' + url
+        # Skip thumbnails narrower than 150px
+        px = re.search(r'/(\d+)px-', url)
+        if px and int(px.group(1)) < 150:
+            return m.group(0)
+        clean_url = url.split('?')[0]  # strip query string for fetching
+        raw_name = urllib.parse.unquote(clean_url.rsplit('/', 1)[-1])
+        filename = re.sub(r'[\\/:*?"<>|]', '_', raw_name)[:120]
+        if not filename:
+            return m.group(0)
+        media_dir.mkdir(exist_ok=True)
+        dest = media_dir / filename
+        if not dest.exists():
+            data = fetch(clean_url) or fetch(url)
+            if not data:
+                return m.group(0)
+            dest.write_bytes(data)
+        downloaded += 1
+        return f'src="media/{filename}"'
+
+    return img_re.sub(replace, html_body)
+
+
+def save_wikinews_article(title: str, date: str, news_dir: Path) -> bool:
+    """
+    Fetch and save one Wikinews article as:
+      <news_dir>/<date> - <title>/index.html
+      <news_dir>/<date> - <title>/media/<images>
+    Returns True if newly saved, False if already exists or skipped.
+    """
+    article_dir = news_dir / f"{date} - {safe_filename(title)}"
+    if (article_dir / "index.html").exists():
+        return False
+
+    html_body = wikinews_fetch_html(title)
+    if not html_body or len(html_body) < 200:
+        return False
+
+    article_dir.mkdir(parents=True, exist_ok=True)
+    media_dir = article_dir / "media"
+
+    html_body = _download_images(html_body, media_dir)
+
+    # Remove media dir if nothing was downloaded
+    if media_dir.exists() and not any(media_dir.iterdir()):
+        media_dir.rmdir()
+
+    url_title = urllib.parse.quote(title.replace(' ', '_'), safe='')
+    page = HTML_WRAPPER.format(
+        title=title,
+        date=date or "unknown",
+        url_title=url_title,
+        body=html_body,
+    )
+    (article_dir / "index.html").write_text(page, encoding='utf-8')
+    return True
+
+
+def save_wikinews_batch(entries: list[tuple[str, str]], max_articles: int, news_dir: Path) -> int:
     seen: set[str] = set()
     saved = 0
-    for title in titles:
+    for title, date in entries:
         if title in seen or title.startswith("Wikinews:"):
             continue
         seen.add(title)
-        dest = NEWS_DIR / f"{safe_filename(title)}.txt"
-        if dest.exists():
+        article_dir = news_dir / f"{date} - {safe_filename(title)}"
+        if (article_dir / "index.html").exists():
             saved += 1
             continue
-        text = wikinews_article_text(title)
-        if not text or len(text) < 100:
-            continue
-        dest.write_text(f"{title}\n\n{text}\n", encoding="utf-8")
-        print(f"  news  {title[:70]}")
-        saved += 1
+        if save_wikinews_article(title, date, news_dir):
+            print(f"  news  {title[:70]}")
+            saved += 1
         if saved >= max_articles:
             break
-        time.sleep(0.3)
+        time.sleep(0.4)
     return saved
 
 
 def fetch_wikinews() -> None:
     print("\n=== Wikinews ===")
 
+    # Migrate any old plain-text files to the new format
+    old_txt = list(NEWS_DIR.glob("*.txt"))
+    if old_txt:
+        print(f"  Removing {len(old_txt)} old .txt files")
+        for f in old_txt:
+            f.unlink(missing_ok=True)
+
     if BACKFILL:
-        # Fetch articles from the last 30 days in weekly chunks
         now   = datetime.now(timezone.utc)
         chunk = timedelta(days=7)
         total = 0
         for week in range(4):
-            end_dt   = now - chunk * week
-            start_dt = end_dt - chunk
+            end_dt    = now - chunk * week
+            start_dt  = end_dt - chunk
             end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            titles = wikinews_titles_by_date(start_str, end_str, limit=200)
-            n = save_wikinews_titles(titles, max_articles=50)
+            entries   = wikinews_titles_by_date(start_str, end_str, limit=200)
+            n = save_wikinews_batch(entries, max_articles=50, news_dir=NEWS_DIR)
             total += n
-            print(f"  week -{week+1}: {n} articles from {start_str[:10]} to {end_str[:10]}")
+            print(f"  week -{week+1}: {n} articles ({start_str[:10]} → {end_str[:10]})")
         print(f"  backfill total: {total} Wikinews articles")
     else:
-        titles = wikinews_recent_titles(80)
-        saved  = save_wikinews_titles(titles, max_articles=40)
+        entries = wikinews_recent_titles(80)
+        saved   = save_wikinews_batch(entries, max_articles=40, news_dir=NEWS_DIR)
 
-        # Remove files that are no longer in the recent window
-        current_names = {safe_filename(t) + ".txt" for t in titles}
-        for f in NEWS_DIR.glob("*.txt"):
-            if f.name not in current_names:
-                f.unlink(missing_ok=True)
+        # Remove article directories no longer in the recent window
+        current_dirs = {
+            f"{date} - {safe_filename(title)}"
+            for title, date in entries
+            if not title.startswith("Wikinews:")
+        }
+        for d in NEWS_DIR.iterdir():
+            if d.is_dir() and d.name not in current_dirs:
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
 
-    print(f"  {NEWS_DIR} now has {len(list(NEWS_DIR.glob('*.txt')))} files")
+    article_count = sum(1 for d in NEWS_DIR.iterdir() if d.is_dir())
+    print(f"  {NEWS_DIR} now has {article_count} articles")
 
 
 # ── arXiv ─────────────────────────────────────────────────────────────────────
@@ -260,7 +360,6 @@ def fetch_arxiv() -> None:
     print("\n=== arXiv ===")
 
     if BACKFILL:
-        # Fetch ~30 days back: 5 pages × 25 results × 4 categories ≈ 500 papers
         pages_per_cat = 5
         for cat in ARXIV_CATS:
             cat_total = 0
@@ -269,7 +368,7 @@ def fetch_arxiv() -> None:
                 for p in papers:
                     write_arxiv_paper(p)
                     cat_total += 1
-                time.sleep(3)  # arXiv rate limit: 3 seconds between requests
+                time.sleep(3)
             print(f"  {cat}: {cat_total} papers (backfill)")
     else:
         for cat in ARXIV_CATS:
