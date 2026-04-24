@@ -1,9 +1,9 @@
 FROM ubuntu:24.04
 
-ARG RELEASE_VERSION=0.7.4
+ARG RELEASE_VERSION=0.7.5
 
 RUN apt-get update && apt-get install -y \
-    ca-certificates curl python3 \
+    ca-certificates curl python3 python3-lxml \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and unpack find-anything release binaries
@@ -13,6 +13,9 @@ RUN curl -fsSL \
 
 # Pre-seeded content — injected at build time via --build-context content=...
 COPY --from=content . /content/
+
+# Demo information — maintained in this repo
+COPY content/demo/ /content/demo/
 
 COPY scripts/ /scripts/
 COPY entrypoint.sh /entrypoint.sh

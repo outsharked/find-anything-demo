@@ -17,6 +17,9 @@ data_dir = "$DATA_DIR"
 token    = "${TOKEN:-}"
 bind     = "0.0.0.0:${PORT:-8765}"
 
+[sources.demo]
+path = "/content/demo"
+
 [sources.wikipedia]
 path = "/content/wikipedia"
 
@@ -44,6 +47,11 @@ cat > "$CLIENT_CONFIG" <<EOF
 [server]
 url   = "http://localhost:${PORT:-8765}"
 token = "${TOKEN:-}"
+
+[[sources]]
+name = "demo"
+path = "/content/demo"
+include = ["**"]
 
 [[sources]]
 name = "wikipedia"

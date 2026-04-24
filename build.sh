@@ -11,10 +11,9 @@ if [ ! -d "$CONTENT_DIR" ]; then
   exit 1
 fi
 
-# Symlink content into repo root for the build context, clean up after
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ln -sfn "$CONTENT_DIR" "$SCRIPT_DIR/content"
-trap 'rm -f "$SCRIPT_DIR/content"' EXIT
 
-docker build -t "$IMAGE" "$SCRIPT_DIR"
+docker build \
+  --build-context content="$CONTENT_DIR" \
+  -t "$IMAGE" "$SCRIPT_DIR"
 echo "Built: $IMAGE"

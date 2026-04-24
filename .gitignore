@@ -1,4 +1,5 @@
 /data/
-/content/
+/content/*/
+!/content/demo/
 __pycache__/
 *.pyc

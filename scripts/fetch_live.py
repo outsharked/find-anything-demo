@@ -17,12 +17,16 @@ Outputs:
 
 import html as html_mod
 import json
+import os
 import re
+import shutil
 import sys
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
+from lxml import html as lxml_html
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -30,9 +34,11 @@ BACKFILL  = "--backfill" in sys.argv
 args      = [a for a in sys.argv[1:] if not a.startswith("--")]
 LIVE_DIR  = Path(args[0]) if args else Path("/content/live")
 NEWS_DIR  = LIVE_DIR / "wikinews"
-ARXIV_DIR = LIVE_DIR / "arxiv"
+ARXIV_DIR      = LIVE_DIR / "arxiv"
+ARXIV_WEEK_DIR = ARXIV_DIR / "this-week"
 NEWS_DIR.mkdir(parents=True, exist_ok=True)
 ARXIV_DIR.mkdir(parents=True, exist_ok=True)
+ARXIV_WEEK_DIR.mkdir(parents=True, exist_ok=True)
 
 HEADERS = {"User-Agent": "find-anything-demo/1.0 (https://github.com/outsharked/find-anything)"}
 
@@ -123,6 +129,33 @@ def wikinews_titles_by_date(start: str, end: str, limit: int = 500) -> list[tupl
     ]
 
 
+def wikinews_published_titles(target: int = 100) -> list[tuple[str, str]]:
+    """Return (title, date) pairs from the Published category, newest first."""
+    results: list[tuple[str, str]] = []
+    cmcontinue: str | None = None
+    while len(results) < target:
+        params: dict = {
+            "action":  "query",
+            "list":    "categorymembers",
+            "cmtitle": "Category:Published",
+            "cmlimit": min(500, target - len(results)),
+            "cmprop":  "title|timestamp",
+            "cmtype":  "page",
+            "cmsort":  "timestamp",
+            "cmdir":   "desc",
+            "format":  "json",
+        }
+        if cmcontinue:
+            params["cmcontinue"] = cmcontinue
+        data = get_json(f"{WIKINEWS_API}?{urllib.parse.urlencode(params)}")
+        for m in data.get("query", {}).get("categorymembers", []):
+            results.append((m["title"], m.get("timestamp", "")[:10]))
+        cmcontinue = data.get("continue", {}).get("cmcontinue")
+        if not cmcontinue:
+            break
+    return results
+
+
 def wikinews_recent_titles(limit: int = 60) -> list[tuple[str, str]]:
     """Return recently changed/created (title, date) pairs."""
     params = urllib.parse.urlencode({
@@ -147,54 +180,86 @@ def wikinews_fetch_html(title: str) -> str | None:
     raw = fetch(f"{WIKINEWS_REST}/html/{encoded}")
     if not raw:
         return None
-    html = raw.decode('utf-8', errors='replace')
-    # Extract just the body content from the full document
-    m = re.search(r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE)
-    return m.group(1).strip() if m else html
+    doc = lxml_html.fromstring(raw.decode('utf-8', errors='replace'))
+    body = doc.find('.//body')
+    el = body if body is not None else doc
+    # Wikimedia includes desktop-only and mobile-only duplicates of some elements;
+    # strip the mobile copies so they don't appear twice in our static HTML.
+    for node in el.xpath('.//*[contains(@class,"mobile-only")]'):
+        node.drop_tree()
+    # Rewrite ./File:... links to Wikimedia Commons so image enlargement works.
+    for a in el.xpath('.//a[starts-with(@href,"./File:")]'):
+        file_name = a.get('href')[2:]  # strip leading ./
+        a.set('href', f'https://commons.wikimedia.org/wiki/{file_name}')
+        a.set('target', '_blank')
+    return (el.text or '') + ''.join(
+        lxml_html.tostring(child, encoding='unicode') for child in el
+    )
 
 
 def _download_images(html_body: str, media_dir: Path) -> str:
     """Download Wikimedia images into media/ and rewrite src attributes."""
-    img_re = re.compile(r'src="((?:https?:)?//upload\.wikimedia\.org/[^"]+)"')
+    root = lxml_html.fragment_fromstring(html_body, create_parent='div')
     downloaded = 0
 
-    def replace(m: re.Match) -> str:
-        nonlocal downloaded
+    for img in list(root.iter('img')):
+        img.attrib.pop('srcset', None)
+
+        src = img.get('src', '')
+        if 'upload.wikimedia.org' not in src:
+            continue
+
         if downloaded >= MAX_IMAGES_PER_ARTICLE:
-            return m.group(0)
-        url = html_mod.unescape(m.group(1))  # decode &amp; → &
+            img.drop_tree()
+            continue
+
+        url = html_mod.unescape(src)
         if url.startswith('//'):
             url = 'https:' + url
-        # Skip thumbnails narrower than 150px
-        px = re.search(r'/(\d+)px-', url)
-        if px and int(px.group(1)) < 150:
-            return m.group(0)
-        clean_url = url.split('?')[0]  # strip query string for fetching
+        clean_url = url.split('?')[0]
         raw_name = urllib.parse.unquote(clean_url.rsplit('/', 1)[-1])
         filename = re.sub(r'[\\/:*?"<>|]', '_', raw_name)[:120]
         if not filename:
-            return m.group(0)
-        media_dir.mkdir(exist_ok=True)
+            img.drop_tree()
+            continue
+
+        try:
+            media_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            img.drop_tree()
+            continue
+
         dest = media_dir / filename
         if not dest.exists():
             data = fetch(clean_url) or fetch(url)
             if not data:
-                return m.group(0)
+                img.drop_tree()
+                continue
             dest.write_bytes(data)
-        downloaded += 1
-        return f'src="media/{filename}"'
 
-    return img_re.sub(replace, html_body)
+        downloaded += 1
+        img.set('src', f'media/{filename}')
+
+    return (root.text or '') + ''.join(
+        lxml_html.tostring(child, encoding='unicode') for child in root
+    )
+
+
+def _month_dir(date: str, news_dir: Path) -> Path:
+    try:
+        return news_dir / datetime.strptime(date, "%Y-%m-%d").strftime("%B %Y")
+    except ValueError:
+        return news_dir / "Unknown"
 
 
 def save_wikinews_article(title: str, date: str, news_dir: Path) -> bool:
     """
     Fetch and save one Wikinews article as:
-      <news_dir>/<date> - <title>/index.html
-      <news_dir>/<date> - <title>/media/<images>
+      <news_dir>/<Month YYYY>/<date> - <title>/index.html
+      <news_dir>/<Month YYYY>/<date> - <title>/media/<images>
     Returns True if newly saved, False if already exists or skipped.
     """
-    article_dir = news_dir / f"{date} - {safe_filename(title)}"
+    article_dir = _month_dir(date, news_dir) / f"{date} - {safe_filename(title)}"
     if (article_dir / "index.html").exists():
         return False
 
@@ -202,6 +267,9 @@ def save_wikinews_article(title: str, date: str, news_dir: Path) -> bool:
     if not html_body or len(html_body) < 200:
         return False
 
+    # Remove any incomplete directory left by a previous failed run
+    if article_dir.exists():
+        shutil.rmtree(article_dir, ignore_errors=True)
     article_dir.mkdir(parents=True, exist_ok=True)
     media_dir = article_dir / "media"
 
@@ -218,7 +286,14 @@ def save_wikinews_article(title: str, date: str, news_dir: Path) -> bool:
         url_title=url_title,
         body=html_body,
     )
-    (article_dir / "index.html").write_text(page, encoding='utf-8')
+    html_path = article_dir / "index.html"
+    html_path.write_text(page, encoding='utf-8')
+    if date:
+        try:
+            ts = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+            os.utime(html_path, (ts, ts))
+        except ValueError:
+            pass
     return True
 
 
@@ -229,7 +304,7 @@ def save_wikinews_batch(entries: list[tuple[str, str]], max_articles: int, news_
         if title in seen or title.startswith("Wikinews:"):
             continue
         seen.add(title)
-        article_dir = news_dir / f"{date} - {safe_filename(title)}"
+        article_dir = _month_dir(date, news_dir) / f"{date} - {safe_filename(title)}"
         if (article_dir / "index.html").exists():
             saved += 1
             continue
@@ -245,43 +320,46 @@ def save_wikinews_batch(entries: list[tuple[str, str]], max_articles: int, news_
 def fetch_wikinews() -> None:
     print("\n=== Wikinews ===")
 
-    # Migrate any old plain-text files to the new format
-    old_txt = list(NEWS_DIR.glob("*.txt"))
-    if old_txt:
-        print(f"  Removing {len(old_txt)} old .txt files")
-        for f in old_txt:
-            f.unlink(missing_ok=True)
+    # Migrate any old plain-text files
+    for f in NEWS_DIR.glob("*.txt"):
+        f.unlink(missing_ok=True)
+
+    # Migrate flat <date> - <title>/ dirs into month subdirs
+    for d in list(NEWS_DIR.iterdir()):
+        if d.is_dir() and re.match(r'^\d{4}-\d{2}-\d{2} - ', d.name):
+            try:
+                dest_dir = _month_dir(d.name[:10], NEWS_DIR)
+                dest_dir.mkdir(exist_ok=True)
+                d.rename(dest_dir / d.name)
+            except (ValueError, OSError):
+                pass
 
     if BACKFILL:
-        now   = datetime.now(timezone.utc)
-        chunk = timedelta(days=7)
-        total = 0
-        for week in range(4):
-            end_dt    = now - chunk * week
-            start_dt  = end_dt - chunk
-            end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            entries   = wikinews_titles_by_date(start_str, end_str, limit=200)
-            n = save_wikinews_batch(entries, max_articles=50, news_dir=NEWS_DIR)
-            total += n
-            print(f"  week -{week+1}: {n} articles ({start_str[:10]} → {end_str[:10]})")
+        entries = wikinews_published_titles(target=150)
+        total   = save_wikinews_batch(entries, max_articles=100, news_dir=NEWS_DIR)
         print(f"  backfill total: {total} Wikinews articles")
     else:
-        entries = wikinews_recent_titles(80)
-        saved   = save_wikinews_batch(entries, max_articles=40, news_dir=NEWS_DIR)
+        entries = wikinews_recent_titles(300)
+        save_wikinews_batch(entries, max_articles=100, news_dir=NEWS_DIR)
 
-        # Remove article directories no longer in the recent window
-        current_dirs = {
-            f"{date} - {safe_filename(title)}"
-            for title, date in entries
-            if not title.startswith("Wikinews:")
-        }
-        for d in NEWS_DIR.iterdir():
-            if d.is_dir() and d.name not in current_dirs:
-                import shutil
-                shutil.rmtree(d, ignore_errors=True)
+        # Keep only the 100 most recent articles across all month dirs
+        all_article_dirs = sorted(
+            (article_dir
+             for month_dir in NEWS_DIR.iterdir() if month_dir.is_dir()
+             for article_dir in month_dir.iterdir() if article_dir.is_dir()),
+            key=lambda d: d.name, reverse=True
+        )
+        for old in all_article_dirs[100:]:
+            shutil.rmtree(old, ignore_errors=True)
+        # Remove empty month dirs
+        for month_dir in list(NEWS_DIR.iterdir()):
+            if month_dir.is_dir() and not any(month_dir.iterdir()):
+                month_dir.rmdir()
 
-    article_count = sum(1 for d in NEWS_DIR.iterdir() if d.is_dir())
+    article_count = sum(
+        1 for month_dir in NEWS_DIR.iterdir() if month_dir.is_dir()
+        for article_dir in month_dir.iterdir() if article_dir.is_dir()
+    )
     print(f"  {NEWS_DIR} now has {article_count} articles")
 
 
@@ -295,9 +373,13 @@ ARXIV_NS   = {
 ARXIV_CATS = ["cs.AI", "cs.CL", "cs.LG", "cs.CV"]
 
 
-def fetch_arxiv_category(cat: str, max_results: int = 25, start: int = 0) -> list[dict]:
+def fetch_arxiv_category(cat: str, max_results: int = 25, start: int = 0,
+                         date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+    query = f"cat:{cat}"
+    if date_from and date_to:
+        query += f" AND submittedDate:[{date_from} TO {date_to}]"
     params = urllib.parse.urlencode({
-        "search_query": f"cat:{cat}",
+        "search_query": query,
         "sortBy":       "submittedDate",
         "sortOrder":    "descending",
         "max_results":  max_results,
@@ -325,9 +407,11 @@ def fetch_arxiv_category(cat: str, max_results: int = 25, start: int = 0) -> lis
             elem_text(a, "atom:name")
             for a in entry.findall("atom:author", ARXIV_NS)
         ]
-        arxiv_id  = id_url.rsplit("/", 1)[-1].replace(".", "_")
+        raw_id    = id_url.rsplit("/", 1)[-1]
+        arxiv_id  = raw_id.replace(".", "_")
         papers.append({
             "id":        arxiv_id,
+            "raw_id":    raw_id,
             "title":     title.strip().replace("\n", " "),
             "summary":   summary.strip(),
             "authors":   authors,
@@ -338,52 +422,112 @@ def fetch_arxiv_category(cat: str, max_results: int = 25, start: int = 0) -> lis
     return papers
 
 
-def write_arxiv_paper(p: dict) -> None:
-    dest = ARXIV_DIR / f"{p['id']}.txt"
+def write_arxiv_paper(p: dict) -> bool:
+    """Download the PDF for a paper. Returns True if newly saved."""
+    dest = ARXIV_WEEK_DIR / f"{p['published']}_{p['id']}.pdf"
     if dest.exists():
-        return
-    author_str = ", ".join(p["authors"][:5])
-    if len(p["authors"]) > 5:
-        author_str += f" and {len(p['authors']) - 5} others"
-    content = (
-        f"{p['title']}\n\n"
-        f"Authors: {author_str}\n"
-        f"Category: {p['category']}\n"
-        f"Published: {p['published']}\n"
-        f"URL: {p['url']}\n\n"
-        f"{p['summary']}\n"
-    )
-    dest.write_text(content, encoding="utf-8")
+        return False
+    pdf_url = f"https://arxiv.org/pdf/{p['raw_id']}"
+    data = fetch(pdf_url)
+    if not data or not data.startswith(b"%PDF"):
+        return False
+    dest.write_bytes(data)
+    try:
+        ts = datetime.strptime(p['published'], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        os.utime(dest, (ts, ts))
+    except ValueError:
+        pass
+    return True
+
+
+def _week_zip_name(pub_date: str) -> str:
+    """Return archive name for the ISO week containing pub_date (YYYY-MM-DD)."""
+    d = datetime.strptime(pub_date, "%Y-%m-%d").date()
+    iso = d.isocalendar()          # (year, week, weekday)
+    week_start = d - timedelta(days=d.weekday())   # Monday
+    mon_abbr = week_start.strftime("%b").lower()
+    return f"{iso[0]}_week-{iso[1]}_{mon_abbr}-{week_start.day}"
+
+
+def archive_old_arxiv_pdfs() -> None:
+    """Zip PDFs from past ISO weeks into weekly archives, remove originals."""
+    today = datetime.now(timezone.utc).date()
+    current_week = today.isocalendar()[:2]  # (year, week)
+
+    by_week: dict[str, list[Path]] = {}
+    for pdf in ARXIV_WEEK_DIR.glob("*.pdf"):
+        m = re.match(r'^(\d{4}-\d{2}-\d{2})_', pdf.name)
+        if not m:
+            continue
+        pub_date = m.group(1)
+        d = datetime.strptime(pub_date, "%Y-%m-%d").date()
+        if d.isocalendar()[:2] == current_week:
+            continue
+        week_key = _week_zip_name(pub_date)
+        by_week.setdefault(week_key, []).append(pdf)
+
+    for week_key, pdfs in sorted(by_week.items()):
+        zip_path = ARXIV_DIR / f"{week_key}.zip"
+        with zipfile.ZipFile(zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as zf:
+            existing = set(zf.namelist())
+            added = 0
+            for pdf in pdfs:
+                if pdf.name not in existing:
+                    zf.write(pdf, pdf.name)
+                    added += 1
+                pdf.unlink(missing_ok=True)
+        print(f"  archived {week_key}: {len(pdfs)} PDFs → {zip_path.name} ({added} new)")
+
+    # Drop oldest archives if total zip storage exceeds 100 MB
+    MAX_ZIP_BYTES = 100 * 1024 * 1024
+    zips = sorted(ARXIV_DIR.glob("*.zip"), key=lambda f: f.name, reverse=True)
+    total = sum(z.stat().st_size for z in zips)
+    while total > MAX_ZIP_BYTES and zips:
+        oldest = zips.pop()
+        total -= oldest.stat().st_size
+        oldest.unlink()
+        print(f"  pruned {oldest.name} (storage cap)")
 
 
 def fetch_arxiv() -> None:
     print("\n=== arXiv ===")
 
     if BACKFILL:
-        pages_per_cat = 5
+        # Fetch 12 papers per category from each of the past 6 weeks
+        now = datetime.now(timezone.utc)
+        weeks = [
+            (now - timedelta(weeks=w+1), now - timedelta(weeks=w))
+            for w in range(6)
+        ]
         for cat in ARXIV_CATS:
             cat_total = 0
-            for page in range(pages_per_cat):
-                papers = fetch_arxiv_category(cat, max_results=25, start=page * 25)
+            for week_start, week_end in weeks:
+                d_from = week_start.strftime("%Y%m%d%H%M%S")
+                d_to   = week_end.strftime("%Y%m%d%H%M%S")
+                papers = fetch_arxiv_category(cat, max_results=5,
+                                              date_from=d_from, date_to=d_to)
                 for p in papers:
-                    write_arxiv_paper(p)
-                    cat_total += 1
+                    if write_arxiv_paper(p):
+                        cat_total += 1
+                        time.sleep(1)
                 time.sleep(3)
-            print(f"  {cat}: {cat_total} papers (backfill)")
+            print(f"  {cat}: {cat_total} new PDFs (backfill)")
     else:
         for cat in ARXIV_CATS:
-            papers = fetch_arxiv_category(cat, max_results=25)
+            papers = fetch_arxiv_category(cat, max_results=5)
+            saved = 0
             for p in papers:
-                write_arxiv_paper(p)
-            print(f"  {cat}: {len(papers)} papers")
+                if write_arxiv_paper(p):
+                    saved += 1
+                    time.sleep(1)
+            print(f"  {cat}: {saved} new PDFs")
             time.sleep(3)
 
-    # Cap total files at 600 (keep most recent by mtime)
-    all_files = sorted(ARXIV_DIR.glob("*.txt"), key=lambda f: f.stat().st_mtime, reverse=True)
-    for old in all_files[600:]:
-        old.unlink(missing_ok=True)
+    archive_old_arxiv_pdfs()
 
-    print(f"  {ARXIV_DIR} now has {len(list(ARXIV_DIR.glob('*.txt')))} files")
+    pdf_count  = len(list(ARXIV_WEEK_DIR.glob("*.pdf")))
+    zip_count  = len(list(ARXIV_DIR.glob("*.zip")))
+    print(f"  {ARXIV_DIR}: {pdf_count} current PDFs, {zip_count} monthly archives")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
